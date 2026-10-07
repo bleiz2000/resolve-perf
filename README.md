@@ -65,6 +65,23 @@ Started from `~/.config/hypr/autostart.lua`:
 o.launch_on_start("/home/YOURUSER/.local/bin/resolve-perf-watch")
 ```
 
+### One switch
+
+`resolve-perf-watch` is also the master switch for the whole system:
+
+```bash
+resolve-perf-watch toggle    # start everything / stop everything
+resolve-perf-watch stop      # kill the watcher + force the quiet state
+resolve-perf-watch start     # relaunch the watcher
+resolve-perf-watch status    # watcher pid + resolve-perf status JSON
+```
+
+`stop` ends the event loop, kills its `socat` child and runs
+`resolve-perf off`, so the laptop is back to `2.6 GHz` / `powersave` /
+`dGPU auto` with nothing left running — no perf state can be left behind
+on battery.
+
+
 ### GPU power limits (no script needed)
 
 Laptop GPUs reject `nvidia-smi -pl` ("not supported") — and the driver already
@@ -77,7 +94,13 @@ So battery consumption never goes up, by design.
 
 ## Install
 
+Step-by-step guide: **[INSTALL.md](INSTALL.md)** — dependencies, installer,
+autostart line, cache directory, test sequence, uninstall and troubleshooting.
+
+Short version:
+
 ```bash
+git clone https://github.com/bleiz2000/resolve-perf.git && cd resolve-perf
 ./install.sh
 ```
 

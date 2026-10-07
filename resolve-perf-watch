@@ -1,21 +1,87 @@
 #!/bin/bash
-# resolve-perf-watch — toggles perf mode while DaVinci Resolve window is open.
+# resolve-perf-watch — performance mode while the DaVinci Resolve window is open.
 # Listens on Hyprland socket2; also re-checks every 60s (AC plug/unplug).
+#
+# usage: resolve-perf-watch [start|stop|toggle|status]
 set -u
 
 RP=/usr/local/sbin/resolve-perf
 STATE=/var/lib/resolve-perf/state
 LOG="$HOME/.local/state/resolve-perf.log"
 LOCK="$XDG_RUNTIME_DIR/resolve-perf-watch.lock"
+PIDFILE="$HOME/.local/state/resolve-perf-watch.pid"
 
 mkdir -p "$(dirname "$LOG")"
+
+logw() { printf '%s watch: %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
+
+running_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null)
+  [ -n "${pid:-}" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  grep -aq "resolve-perf-watch" "/proc/$pid/cmdline" 2>/dev/null
+}
+
+do_stop() {
+  local pid out stopped=no
+  if running_pid; then
+    pid=$(cat "$PIDFILE")
+    kill "$pid" 2>/dev/null
+    for _ in $(seq 1 25); do
+      kill -0 "$pid" 2>/dev/null || { stopped=yes; break; }
+      sleep 0.2
+    done
+    [ "$stopped" = yes ] || kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "$PIDFILE"
+  out=$(sudo -n "$RP" off 2>/dev/null)
+  logw "stopped by user (off: ${out:-noop})"
+  echo "resolve-perf: watcher stopped, quiet state (${out:-noop})"
+}
+
+do_status() {
+  if running_pid; then
+    echo "watcher: running (pid $(cat "$PIDFILE"))"
+  else
+    echo "watcher: stopped"
+  fi
+  sudo -n "$RP" status 2>/dev/null || echo "mode: unknown (resolve-perf status needs sudo)"
+}
+
+do_start_bg() {
+  if running_pid; then
+    echo "watcher: already running (pid $(cat "$PIDFILE"))"
+    return 0
+  fi
+  SELF=$(readlink -f "$0")
+  setsid -f "$SELF" __daemon >/dev/null 2>&1
+  sleep 0.7
+  if running_pid; then
+    echo "watcher: started (pid $(cat "$PIDFILE"))"
+  else
+    echo "watcher: failed to start — see $LOG" >&2
+    return 1
+  fi
+}
+
+case "${1:-start}" in
+  start) do_start_bg; exit 0 ;;
+  __daemon) : ;; # internal: the daemon loop itself, runs in foreground
+  stop)  do_stop; exit 0 ;;
+  status) do_status; exit 0 ;;
+  toggle) if running_pid; then do_stop; else do_start_bg; fi; exit 0 ;;
+  -h|--help|help)
+    echo "usage: resolve-perf-watch [start|stop|toggle|status]"; exit 0 ;;
+  *) echo "unknown command: $1 (start|stop|toggle|status)" >&2; exit 2 ;;
+esac
+
 exec 9>"$LOCK"
 if ! flock -n 9; then
   printf '%s watch: already running\n' "$(date '+%F %T')" >>"$LOG" 2>/dev/null
   exit 0
 fi
-
-logw() { printf '%s watch: %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
+echo $$ >"$PIDFILE"
 
 resolve_open() {
   # class depends on argv0: "resolve" via /opt/resolve/bin/resolve,
@@ -41,6 +107,7 @@ apply() {
 
 cleanup() {
   pkill -P $$ 2>/dev/null # socat (process substitution child)
+  rm -f "$PIDFILE"
   [ -f "$STATE" ] && sudo -n "$RP" off >/dev/null 2>&1
   logw "stopped"
 }
