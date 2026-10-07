@@ -1,0 +1,227 @@
+#!/bin/bash
+# resolve-perf — performance mode for DaVinci Resolve (AC power only).
+# Never touches RAPL, fans, platform_profile. On battery it changes nothing.
+set -u
+
+STATE_DIR=/var/lib/resolve-perf
+STATE_FILE="$STATE_DIR/state"
+# log lives in the invoking user's home (works via `sudo`, SUDO_USER is set)
+_ruser="${SUDO_USER:-$(id -un)}"
+_rhome=$(getent passwd "$_ruser" | cut -d: -f6)
+LOG="${_rhome:-/tmp}/.local/state/resolve-perf.log"
+
+log() {
+  mkdir -p "$(dirname "$LOG")"
+  [ -e "$LOG" ] || : >>"$LOG" 2>/dev/null
+  chmod 0666 "$LOG" 2>/dev/null
+  printf '%s resolve-perf: %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+}
+
+ac_online() {
+  local s t o
+  for s in /sys/class/power_supply/*; do
+    t=$(cat "$s/type" 2>/dev/null) || continue
+    [ "$t" = "Mains" ] || continue
+    o=$(cat "$s/online" 2>/dev/null) || continue
+    [ "$o" = "1" ] && return 0
+  done
+  return 1
+}
+
+dgpu_control() {
+  local d vendor class
+  for d in /sys/bus/pci/devices/*; do
+    [ -e "$d/power/control" ] || continue
+    vendor=$(cat "$d/vendor" 2>/dev/null)
+    class=$(cat "$d/class" 2>/dev/null)
+    if [ "$vendor" = "0x10de" ] && [ "$class" = "0x030000" ]; then
+      echo "$d/power/control"
+      return 0
+    fi
+  done
+  return 1
+}
+
+policies() {
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -e "$p/scaling_governor" ] && echo "$p"
+  done
+}
+
+# IA32_MISC_ENABLE bit 38 — "Intel Turbo Boost disabled". HP BIOS sets it at
+# boot; intel_pstate then refuses no_turbo=0 with EPERM. Clearing the bit in
+# MSR unlocks turbo (verified: cpuinfo_max_freq 2600 -> 4700 MHz).
+MSR_MISC=0x1A0
+TURBO_OFF_BIT=$((1 << 38))
+
+msr_ready() {
+  [ -e /dev/cpu/0/msr ] && return 0
+  modprobe msr 2>/dev/null
+  [ -e /dev/cpu/0/msr ]
+}
+
+turbo_unlock() {
+  msr_ready || return 1
+  local v
+  v=$(rdmsr "$MSR_MISC" 2>/dev/null) || return 1
+  [ -n "$v" ] || return 1
+  # wrmsr parses "0x..." explicitly; bare digits would be read as decimal
+  wrmsr -a "$MSR_MISC" "0x$(printf '%x' $((0x$v & ~TURBO_OFF_BIT)))" 2>/dev/null
+}
+
+turbo_lock() {
+  msr_ready || return 1
+  local v
+  v=$(rdmsr "$MSR_MISC" 2>/dev/null) || return 1
+  [ -n "$v" ] || return 1
+  wrmsr -a "$MSR_MISC" "0x$(printf '%x' $((0x$v | TURBO_OFF_BIT)))" 2>/dev/null
+}
+
+nvidia_pm_state() {
+  nvidia-smi -q -d PERSISTENCE_MODE 2>/dev/null |
+    awk -F: '/Persistence Mode/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print tolower($2); exit}'
+}
+
+save_state() {
+  mkdir -p "$STATE_DIR"
+  : >"$STATE_FILE"
+  printf 'no_turbo=%s\n' "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)" >>"$STATE_FILE"
+  local p
+  for p in $(policies); do
+    printf 'gov:%s=%s\n' "${p##*/policy}" "$(cat "$p/scaling_governor" 2>/dev/null)" >>"$STATE_FILE"
+    [ -e "$p/energy_performance_preference" ] &&
+      printf 'epp:%s=%s\n' "${p##*/policy}" "$(cat "$p/energy_performance_preference" 2>/dev/null)" >>"$STATE_FILE"
+  done
+  if msr_ready; then
+    printf 'msr1a0=%s\n' "$(rdmsr "$MSR_MISC" 2>/dev/null)" >>"$STATE_FILE"
+  fi
+  printf 'npl=%s\n' "$(nvidia-smi --query-gpu=power.limit --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')" >>"$STATE_FILE"
+  printf 'npm=%s\n' "$(nvidia_pm_state)" >>"$STATE_FILE"
+  local dc
+  dc=$(dgpu_control)
+  [ -n "$dc" ] && printf 'dgpu=%s\n' "$(cat "$dc" 2>/dev/null)" >>"$STATE_FILE"
+}
+
+restore_state() {
+  [ -f "$STATE_FILE" ] || return 1
+  local key val p dc
+  while IFS='=' read -r key val; do
+    case "$key" in
+      no_turbo)
+        [ -n "$val" ] && printf '%s\n' "$val" >/sys/devices/system/cpu/intel_pstate/no_turbo
+        ;;
+      gov:*)
+        p="/sys/devices/system/cpu/cpufreq/policy${key#gov:}"
+        [ -n "$val" ] && printf '%s\n' "$val" >"$p/scaling_governor" 2>/dev/null
+        ;;
+      epp:*)
+        p="/sys/devices/system/cpu/cpufreq/policy${key#epp:}"
+        [ -n "$val" ] && printf '%s\n' "$val" >"$p/energy_performance_preference" 2>/dev/null
+        ;;
+      msr1a0)
+        if msr_ready && [ -n "$val" ]; then
+          case "$val" in
+            [0-9a-fA-F]*) wrmsr -a "$MSR_MISC" "0x$(printf '%x' "$((0x$val))")" 2>/dev/null ;;
+          esac
+        fi
+        ;;
+      npl)
+        # laptop GPUs reject nvidia-smi -pl; kept for state completeness
+        [ -n "$val" ] && case "$val" in N/A | "") ;; *) nvidia-smi -pl "$val" >/dev/null 2>&1 ;; esac
+        ;;
+      npm)
+        case "$val" in
+          enabled) nvidia-smi -pm 1 >/dev/null 2>&1 ;;
+          disabled) nvidia-smi -pm 0 >/dev/null 2>&1 ;;
+        esac
+        ;;
+      dgpu)
+        dc=$(dgpu_control)
+        [ -n "$dc" ] && [ -n "$val" ] && printf '%s\n' "$val" >"$dc" 2>/dev/null
+        ;;
+    esac
+  done <"$STATE_FILE"
+  rm -f "$STATE_FILE"
+  return 0
+}
+
+apply_on() {
+  turbo_unlock
+  if ! printf '0\n' >/sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null; then
+    log "WARN: no_turbo write rejected"
+  fi
+  local p
+  for p in $(policies); do
+    printf 'performance\n' >"$p/scaling_governor" 2>/dev/null
+    [ -e "$p/energy_performance_preference" ] &&
+      printf 'performance\n' >"$p/energy_performance_preference" 2>/dev/null
+  done
+  nvidia-smi -pm 1 >/dev/null 2>&1
+  local dc
+  dc=$(dgpu_control)
+  [ -n "$dc" ] && printf 'on\n' >"$dc" 2>/dev/null
+}
+
+do_on() {
+  if ! ac_online; then
+    if [ -f "$STATE_FILE" ]; then
+      restore_state
+      log "battery: reverted to quiet state"
+      echo "reverted-battery"
+    else
+      log "battery: nothing changed"
+      echo "skipped-battery"
+    fi
+    return 0
+  fi
+  if [ -f "$STATE_FILE" ]; then
+    echo "already-on"
+    return 0
+  fi
+  save_state
+  apply_on
+  log "AC: performance on (turbo unlocked, governor=performance, dgpu=on)"
+  echo "applied-on"
+}
+
+do_off() {
+  if restore_state; then
+    log "restored quiet state"
+    echo "restored"
+  else
+    echo "noop"
+  fi
+}
+
+do_status() {
+  local ac no pl gov dc maxf msrbit
+  ac=0
+  ac_online && ac=1
+  no=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)
+  pl=$(nvidia-smi --query-gpu=power.limit,power.draw,temperature.gpu --format=csv,noheader 2>/dev/null | tr -d ' ')
+  gov=$(cat "$(policies | head -1)/scaling_governor" 2>/dev/null)
+  dc=$(dgpu_control)
+  maxf=$(cat "$(policies | head -1)/scaling_max_freq" 2>/dev/null)
+  msrbit=n/a
+  if msr_ready; then
+    local m
+    m=$(rdmsr "$MSR_MISC" 2>/dev/null || true)
+    if [ -n "$m" ]; then
+      if [ $((0x$m & TURBO_OFF_BIT)) -ne 0 ]; then msrbit=disabled; else msrbit=enabled; fi
+    fi
+  fi
+  printf '{"active":%s,"ac":%s,"no_turbo":%s,"turbo_msr":"%s","max_freq_khz":%s,"governor":"%s","gpu":"%s","dgpu_control":"%s"}\n' \
+    "$([ -f "$STATE_FILE" ] && echo true || echo false)" \
+    "$([ "$ac" = 1 ] && echo true || echo false)" \
+    "$no" "$msrbit" "$maxf" "$gov" "$pl" "$(cat "${dc:-/dev/null}" 2>/dev/null)"
+}
+
+case "${1:-}" in
+  on) do_on ;;
+  off) do_off ;;
+  status) do_status ;;
+  *)
+    echo "usage: resolve-perf {on|off|status}" >&2
+    exit 2
+    ;;
+esac

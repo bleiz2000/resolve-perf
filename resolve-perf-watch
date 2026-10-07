@@ -1,0 +1,71 @@
+#!/bin/bash
+# resolve-perf-watch — toggles perf mode while DaVinci Resolve window is open.
+# Listens on Hyprland socket2; also re-checks every 60s (AC plug/unplug).
+set -u
+
+RP=/usr/local/sbin/resolve-perf
+STATE=/var/lib/resolve-perf/state
+LOG="$HOME/.local/state/resolve-perf.log"
+LOCK="$XDG_RUNTIME_DIR/resolve-perf-watch.lock"
+
+mkdir -p "$(dirname "$LOG")"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  printf '%s watch: already running\n' "$(date '+%F %T')" >>"$LOG" 2>/dev/null
+  exit 0
+fi
+
+logw() { printf '%s watch: %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
+
+resolve_open() {
+  # class depends on argv0: "resolve" via /opt/resolve/bin/resolve,
+  # "davinci-resolve-studio" via the symlink/desktop entry
+  hyprctl clients -j 2>/dev/null | jq -e \
+    '[.[] | select(((.class // "") + " " + (.initialClass // "")) | test("resolve";"i"))] | length > 0' \
+    >/dev/null 2>&1
+}
+
+apply() {
+  local out
+  if resolve_open; then
+    out=$(sudo -n "$RP" on 2>/dev/null)
+  else
+    out=$(sudo -n "$RP" off 2>/dev/null)
+  fi
+  case "$out" in
+    applied-on) logw "mode ON"; notify-send -u normal "Resolve" "Performance mode: ON (AC)" 2>/dev/null ;;
+    reverted-battery) logw "battery: mode OFF"; notify-send -u normal "Resolve" "Battery — performance mode off" 2>/dev/null ;;
+    restored) logw "mode OFF"; notify-send -u normal "Resolve" "Performance mode: OFF" 2>/dev/null ;;
+  esac
+}
+
+cleanup() {
+  pkill -P $$ 2>/dev/null # socat (process substitution child)
+  [ -f "$STATE" ] && sudo -n "$RP" off >/dev/null 2>&1
+  logw "stopped"
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+sock=$(ls -t "$XDG_RUNTIME_DIR"/hypr/*/.socket2.sock 2>/dev/null | head -1)
+if [ -z "$sock" ]; then
+  logw "no Hyprland socket2 found, exiting"
+  exit 1
+fi
+
+logw "started (socket: $sock)"
+apply
+
+exec 3< <(socat -U - "UNIX-CONNECT:$sock")
+
+while true; do
+  if read -r -t 60 line <&3; then
+    case "$line" in
+      openwindow\>\>* | closewindow\>\>*) apply ;;
+    esac
+  else
+    rc=$?
+    [ "$rc" -gt 128 ] || break # EOF: Hyprland/socat went away
+    apply                      # periodic check: AC state / missed events
+  fi
+done
